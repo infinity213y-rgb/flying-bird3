@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Flap & Fly — Fixed Particles (Modern)</title>
+<style>
+  :root{
+    --bg-top:#9ad5ff; --bg-bottom:#c9f3ff; --panel: rgba(255,255,255,0.92); --accent:#34bfa3;
+  }
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg-top),var(--bg-bottom));font-family:Inter,system-ui,Arial,sans-serif;display:flex;align-items:center;justify-content:center}
+  #container{width:95%;max-width:1000px;height:80vh;max-height:780px;position:relative}
+  canvas{width:100%;height:100%;display:block;border-radius:12px;box-shadow:0 24px 60px rgba(7,25,40,0.18);background:transparent}
+  #hud{position:absolute;left:12px;top:12px;background:var(--panel);padding:8px 10px;border-radius:10px;display:flex;gap:12px;align-items:center;box-shadow:0 8px 18px rgba(0,0,0,0.06)}
+  #controls{position:absolute;right:12px;top:12px;background:var(--panel);padding:8px;border-radius:10px;display:flex;gap:8px;align-items:center}
+  button{background:var(--accent);color:#fff;border:0;padding:8px 10px;border-radius:8px;cursor:pointer;font-weight:700;box-shadow:0 6px 14px rgba(52,191,163,0.18)}
+  #overlay{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.45);color:#fff;padding:18px 20px;border-radius:12px;text-align:center;display:none}
+  #overlay h1{margin:0 0 8px;font-size:28px}
+  #hint{position:absolute;left:12px;bottom:12px;background:var(--panel);padding:8px;border-radius:8px}
+  @media (max-width:600px){ #hud{flex-direction:column;left:8px;top:8px} #controls{right:8px;top:8px} }
+</style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="game" width="1000" height="700" role="img" aria-label="Flap and Fly game"></canvas>
+    <div id="hud"><div>Score: <strong id="score">0</strong></div><div>High: <strong id="high">0</strong></div></div>
+    <div id="controls"><button id="mute">Mute</button><button id="restart">Restart</button></div>
+    <div id="overlay"><h1 id="overlayTitle">Tap to Start</h1><div id="overlaySub">Tap or press Space to flap • Avoid the pipes</div></div>
+    <div id="hint">Tap anywhere or press Space</div>
+  </div>
+
+<script>
+/* Flap & Fly — Fixed Particles
+   - Particles are drawn behind the bird
+   - Particle count capped
+   - Bird base64 SVG embedded
+   - Single-file, offline
+*/
+
+(() => {
+  // Canvas setup
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // UI elements
+  const scoreEl = document.getElementById('score');
+  const highEl = document.getElementById('high');
+  const overlay = document.getElementById('overlay');
+  const overlayTitle = document.getElementById('overlayTitle');
+  const overlaySub = document.getElementById('overlaySub');
+  const muteBtn = document.getElementById('mute');
+  const restartBtn = document.getElementById('restart');
+
+  // Game constants (tuned)
+  const GRAVITY = 1100;
+  const FLAP_VELOCITY = -420;
+  const MAX_FALL_SPEED = 900;
+  const PIPE_SPEED = 260;
+  const PIPE_GAP = 170;
+  const PIPE_SPACING = 280;
+  const FLOOR_H = 110;
+
+  // State
+  let score = 0;
+  let high = parseInt(localStorage.getItem('ff_high') || 0);
+  highEl.textContent = high;
+  let started = false, gameOver = false, lastTime = 0;
+  let pipes = []; // segments (x,y,w,h,kind)
+  let particles = [];
+  const PARTICLE_LIMIT = 140; // cap to avoid overload
+  let lastPipeX = W + 300;
+  let mute = false;
+
+  // Bird
+  const bird = { x: 180, y: H/2, w: 56, h: 44, vy: 0, angle: 0 };
+
+  // Pre-built embedded images (SVG data URLs)
+  function svgData(svg){ return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg); }
+
+  const imgData = {
+    bird: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="128" height="96" viewBox="0 0 128 96">
+      <defs><filter id="ds" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity="0.18"/></filter></defs>
+      <g filter="url(#ds)">
+        <ellipse cx="44" cy="48" rx="34" ry="24" fill="#FFD68A"/>
+        <path d="M62,36 q20,8 30,28 q-12,-2 -28,-2 q-12,-14 -2,-26" fill="#FF9E7D"/>
+        <circle cx="36" cy="44" r="5" fill="#151515"/>
+        <path d="M74 52 q8 -4 12 0 q-6 6 -12 0" fill="#FFCE80"/>
+        <rect x="86" y="34" width="18" height="18" rx="6" fill="#FF7043" transform="rotate(18 95 43)"/>
+      </g>
+    </svg>`),
+
+    pipeTop: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="128" viewBox="0 0 64 128">
+      <defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#63b36a"/><stop offset="1" stop-color="#2f8b3e"/></linearGradient></defs>
+      <rect width="64" height="48" rx="6" fill="#1f7a3a"/>
+      <rect y="48" width="64" height="80" fill="url(#g)"/>
+      <ellipse cx="32" cy="44" rx="22" ry="8" fill="#2a8b45"/>
+    </svg>`),
+
+    pipeMid: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+      <rect width="64" height="64" fill="#2f8b3e"/>
+      <rect y="0" width="64" height="8" fill="#1f7a3a" opacity="0.6"/>
+      <rect y="56" width="64" height="8" fill="#1f7a3a" opacity="0.6"/>
+    </svg>`),
+
+    ground: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120">
+      <rect width="320" height="120" fill="#6a4f3a"/><rect y="0" width="320" height="22" fill="#7ecb57"/>
+      <g fill="#5aa744" opacity="0.8"><circle cx="48" cy="18" r="12"/><circle cx="112" cy="22" r="12"/><circle cx="192" cy="16" r="12"/><circle cx="256" cy="24" r="12"/></g>
+    </svg>`),
+
+    cloudA: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120"><g fill="#fff" opacity="0.9"><ellipse cx="60" cy="60" rx="60" ry="36"/><ellipse cx="130" cy="52" rx="48" ry="32"/><ellipse cx="190" cy="62" rx="44" ry="28"/></g></svg>`),
+    cloudB: svgData(`<svg xmlns="http://www.w3.org/2000/svg" width="180" height="80"><g fill="#fff" opacity="0.92"><ellipse cx="40" cy="36" rx="38" ry="24"/><ellipse cx="110" cy="36" rx="36" ry="20"/></g></svg>`)
+  };
+
+  // Load images into Image objects
+  const IM = {};
+  let loadCount = 0, totalToLoad = Object.keys(imgData).length;
+  Object.entries(imgData).forEach(([k,src])=>{
+    const im = new Image();
+    im.onload = ()=>{ IM[k]=im; loadCount++; if(loadCount===totalToLoad) onAssetsLoaded(); };
+    im.src = src;
+  });
+
+  // WebAudio (procedural sounds)
+  const AudioCtx = window.AudioContext||window.webkitAudioContext;
+  const actx = new AudioCtx();
+  const master = actx.createGain(); master.connect(actx.destination); master.gain.value = 1;
+  const sfxGain = actx.createGain(); sfxGain.connect(master); sfxGain.gain.value = 0.9;
+  const musicGain = actx.createGain(); musicGain.connect(master); musicGain.gain.value = 0.14;
+  let musicPlaying = false;
+
+  function playSound(type){
+    if (mute) return;
+    const now = actx.currentTime;
+    if (type==='flap'){ // two-tone quick flap
+      const o=actx.createOscillator(); o.type='triangle'; o.frequency.value=720;
+      const g=actx.createGain(); g.gain.setValueAtTime(0.0001,now); g.gain.linearRampToValueAtTime(0.12,now+0.01); g.gain.exponentialRampToValueAtTime(0.0001,now+0.12);
+      o.connect(g); g.connect(sfxGain); o.start(now); o.stop(now+0.13);
+      const o2=actx.createOscillator(); o2.type='sine'; o2.frequency.value=1080; const g2=actx.createGain(); g2.gain.setValueAtTime(0.0001,now); g2.gain.linearRampToValueAtTime(0.06,now+0.01); g2.gain.exponentialRampToValueAtTime(0.0001,now+0.13);
+      o2.connect(g2); g2.connect(sfxGain); o2.start(now); o2.stop(now+0.13);
+    } else if (type==='score'){ const o=actx.createOscillator(); o.type='sine'; o.frequency.value=880; const g=actx.createGain(); g.gain.setValueAtTime(0.0001,now); g.gain.linearRampToValueAtTime(0.14,now+0.01); g.gain.exponentialRampToValueAtTime(0.0001,now+0.18); o.connect(g); g.connect(sfxGain); o.start(now); o.stop(now+0.2); }
+    else if (type==='hit'){ const o=actx.createOscillator(); o.type='sawtooth'; o.frequency.value=120; const g=actx.createGain(); g.gain.setValueAtTime(0.0001,now); g.gain.linearRampToValueAtTime(0.2,now+0.02); g.gain.exponentialRampToValueAtTime(0.0001,now+0.45); o.connect(g); g.connect(sfxGain); o.start(now); o.stop(now+0.45); }
+  }
+
+  function startAmbience(){
+    if (musicPlaying || mute) return;
+    musicPlaying = true;
+    const now = actx.currentTime + 0.02;
+    const notes = [440,0,660,0,880,0,660,0];
+    notes.forEach((n,i)=>{
+      if (!n) return;
+      const o = actx.createOscillator(); o.type='square'; o.frequency.value=n;
+      const g = actx.createGain(); g.gain.setValueAtTime(0, now + i*0.36); g.gain.linearRampToValueAtTime(0.06, now + i*0.36 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, now + i*0.36 + 0.3);
+      o.connect(g); g.connect(musicGain); o.start(now + i*0.36); o.stop(now + i*0.36 + 0.32);
+    });
+  }
+
+  // Parallax elements
+  const parallax = {
+    far: Array.from({length:6}, (_,i)=>({x:i*420 + Math.random()*60, y:60 + Math.random()*20, w:420})),
+    mid: Array.from({length:6}, (_,i)=>({x:i*360 + Math.random()*40, y:160 + Math.random()*40, w:360})),
+    front: Array.from({length:10}, (_,i)=>({x:i*320 + Math.random()*40, y:H - FLOOR_H + 6, w:320}))
+  };
+
+  // spawn pipe pair (creates segments)
+  function spawnPipeSet(atX){
+    const gapCenter = 140 + Math.random()*(H - FLOOR_H - 300);
+    // top stack
+    for (let y = -64; y + 64 < gapCenter - PIPE_GAP/2; y += 64){
+      pipes.push({x:atX, y:y, w:64, h:64, kind:'top', groupX:atX});
+    }
+    // bottom stack
+    for (let y = gapCenter + PIPE_GAP/2; y < H - FLOOR_H; y += 64){
+      pipes.push({x:atX, y:y, w:64, h:64, kind:'mid', groupX:atX});
+    }
+    lastPipeX = atX;
+  }
+
+  // particle emitter behind bird
+  function emit(x,y,count=10,color='#ffea70'){
+    for (let i=0;i<count;i++){
+      particles.push({
+        x: x + (Math.random()-0.5)*18,
+        y: y + (Math.random()-0.5)*18,
+        vx: (Math.random()-0.5)*160,
+        vy: -40 - Math.random()*260,
+        life: 0.4 + Math.random()*0.6,
+        size: 2 + Math.random()*4,
+        color
+      });
+    }
+    // cap total particles to prevent flooding
+    if (particles.length > PARTICLE_LIMIT){
+      particles.splice(0, particles.length - PARTICLE_LIMIT);
+    }
+  }
+
+  // reset game
+  function reset(){
+    score = 0; scoreEl.textContent = score;
+    pipes = []; particles = [];
+    bird.x = 180; bird.y = H/2; bird.vy = 0; bird.angle = 0;
+    started = false; gameOver = false;
+    overlay.style.display = 'flex'; overlayTitle.textContent = 'Tap to Start'; overlaySub.textContent = 'Tap or Space to flap • Avoid pipes';
+    // initial pipe ahead for visuals
+    spawnPipeSet(W + 200);
+  }
+
+  // end game
+  function endGame(){
+    if (gameOver) return;
+    gameOver = true; playSound('hit');
+    // show overlay with short fade
+    setTimeout(()=>{ overlayTitle.textContent = 'GAME OVER'; overlaySub.textContent = `Score ${score} • Tap/Space to restart`; overlay.style.display = 'flex'; }, 220);
+    if (score > high){ high = score; localStorage.setItem('ff_high', high); highEl.textContent = high; }
+  }
+
+  // flap action
+  function flapAction(){
+    if (actx && actx.state === 'suspended') actx.resume();
+    if (!started){
+      started = true; overlay.style.display = 'none';
+      spawnPipeSet(W + 420); // ensure pipes start
+      startAmbience();
+    }
+    if (gameOver){
+      // restart with short fade
+      overlay.style.display = 'none';
+      setTimeout(reset, 180);
+      return;
+    }
+    bird.vy = FLAP_VELOCITY;
+    emit(bird.x - 6, bird.y, 8, '#ffd59e');
+    playSound('flap');
+  }
+
+  // input
+  canvas.addEventListener('pointerdown', (e) => { flapAction(); });
+  window.addEventListener('keydown', (e) => { if (e.code === 'Space' || e.code === 'ArrowUp'){ e.preventDefault(); flapAction(); } });
+
+  // buttons
+  muteBtn.addEventListener('click', ()=>{ mute = !mute; master.gain.value = mute ? 0 : 1; muteBtn.textContent = mute ? 'Unmute' : 'Mute'; });
+  restartBtn.addEventListener('click', ()=>{ reset(); });
+
+  // update loop
+  let last = performance.now();
+  function update(dt){
+    // early parallax movement (even when not started)
+    parallax.far.forEach(p => p.x -= 20 * dt);
+    parallax.mid.forEach(p => p.x -= 52 * dt);
+    parallax.front.forEach(p => p.x -= 140 * dt);
+
+    if (!started || gameOver){
+      // update particles only so they don't accumulate in front
+      for (let i = particles.length - 1; i >= 0; i--){
+        const pr = particles[i];
+        pr.vy += 900 * dt; pr.x += pr.vx * dt; pr.y += pr.vy * dt; pr.life -= dt;
+        if (pr.life <= 0) particles.splice(i,1);
+      }
+      return;
+    }
+
+    // bird physics
+    bird.vy += GRAVITY * dt;
+    if (bird.vy > MAX_FALL_SPEED) bird.vy = MAX_FALL_SPEED;
+    bird.y += bird.vy * dt;
+    bird.angle = Math.max(-0.8, Math.min(1.2, bird.vy / 380));
+
+    // move pipes
+    for (let i = pipes.length-1; i >=0; i--){
+      const p = pipes[i];
+      p.x -= PIPE_SPEED * dt;
+      if (p.x + p.w < -200) pipes.splice(i,1);
+    }
+
+    // spawn when rightmost pipe is past threshold
+    const rightMostX = pipes.reduce((m,p)=>Math.max(m,p.x), -9999);
+    if (rightMostX < W - PIPE_SPACING) spawnPipeSet(W + 200);
+
+    // scoring: only when crossing a group's mid-segment and only once per group
+    // identify unique group positions
+    const groupXs = [...new Set(pipes.filter(p=>p.kind==='mid').map(p=>Math.round(p.groupX)))];
+    groupXs.forEach(gx=>{
+      // find mid segment for that group with smallest y (topmost mid) and check x center
+      const mids = pipes.filter(p => p.kind==='mid' && Math.round(p.groupX) === gx);
+      const anyMid = mids[0];
+      if (!anyMid) return;
+      if (!anyMid._counted && (anyMid.x + anyMid.w/2) < bird.x - 6){
+        // count only once per group
+        mids.forEach(m=> m._counted = true);
+        score++; scoreEl.textContent = score;
+        playSound('score'); emit(bird.x, bird.y - 8, 14, '#fff476');
+      }
+    });
+
+    // collision: ground
+    if (bird.y + bird.h/2 > H - FLOOR_H){
+      bird.y = H - FLOOR_H - bird.h/2;
+      endGame();
+    }
+
+    // collision: pipes via AABB conservative test
+    for (let i=0;i<pipes.length;i++){
+      const p = pipes[i];
+      const pipeRect = {x: p.x + p.w/2, y: p.y + p.h/2, w: p.w, h: p.h};
+      const birdRect = {x: bird.x, y: bird.y, w: bird.w, h: bird.h};
+      if (Math.abs(pipeRect.x - birdRect.x) < (pipeRect.w/2 + birdRect.w/2) &&
+          Math.abs(pipeRect.y - birdRect.y) < (pipeRect.h/2 + birdRect.h/2)){
+        endGame(); break;
+      }
+    }
+
+    // update particles
+    for (let i = particles.length - 1; i >= 0; i--){
+      const pr = particles[i];
+      pr.vy += 900 * dt; pr.x += pr.vx * dt; pr.y += pr.vy * dt; pr.life -= dt;
+      if (pr.life <= 0) particles.splice(i,1);
+    }
+
+    // rewrap parallax pieces (wrap effect)
+    parallax.far.forEach(p => { if (p.x < -p.w - 100) p.x += p.w * parallax.far.length + 600; });
+    parallax.mid.forEach(p => { if (p.x < -p.w - 80) p.x += p.w * parallax.mid.length + 420; });
+    parallax.front.forEach(p => { if (p.x < -p.w - 160) p.x += p.w * parallax.front.length + 800; });
+  }
+
+  // draw loop (note: particles drawn BEFORE bird so bird remains visible)
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // background gradient
+    const grad = ctx.createLinearGradient(0,0,0,H);
+    grad.addColorStop(0,'#9ad5ff'); grad.addColorStop(1,'#c9f3ff');
+    ctx.fillStyle = grad; ctx.fillRect(0,0,W,H);
+
+    // draw far clouds
+    parallax.far.forEach(p => {
+      const im = IM.cloudA;
+      if (im) ctx.drawImage(im, p.x, p.y, p.w, p.w * (im.height / im.width));
+    });
+    // mid clouds
+    parallax.mid.forEach(p => {
+      const im = IM.cloudB;
+      if (im) ctx.drawImage(im, p.x, p.y, p.w, p.w * (im.height / im.width));
+    });
+
+    // draw pipes (segments)
+    pipes.forEach(p => {
+      const im = (p.kind === 'top') ? IM.pipeTop : IM.pipeMid;
+      if (im) ctx.drawImage(im, p.x, p.y, p.w, p.h);
+      else { ctx.fillStyle='#2f8b3e'; ctx.fillRect(p.x,p.y,p.w,p.h); }
+    });
+
+    // draw front ground
+    parallax.front.forEach(f => {
+      const im = IM.ground;
+      if (im) ctx.drawImage(im, f.x, f.y, f.w, 120);
+    });
+
+    // draw particles **behind** bird (FIX)
+    particles.forEach(pr => {
+      ctx.globalAlpha = Math.max(0, pr.life);
+      ctx.fillStyle = pr.color;
+      ctx.beginPath();
+      ctx.ellipse(pr.x, pr.y, pr.size, pr.size, 0, 0, Math.PI*2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+
+    // draw soft shadow under bird
+    ctx.save();
+    ctx.globalAlpha = 0.24;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(bird.x, Math.min(bird.y + bird.h/2 + 14, H - FLOOR_H + 4), bird.w*0.5, 10, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    // draw bird on top of particles
+    ctx.save();
+    ctx.translate(bird.x, bird.y);
+    ctx.rotate(bird.angle);
+    if (IM.bird) ctx.drawImage(IM.bird, -bird.w/2, -bird.h/2, bird.w, bird.h);
+    else { ctx.fillStyle='#ffd59e'; ctx.fillRect(-bird.w/2, -bird.h/2, bird.w, bird.h); }
+    ctx.restore();
+
+    // if game over draw overlay text on canvas (in addition to DOM)
+    if (gameOver){
+      ctx.fillStyle = 'rgba(0,0,0,0.36)';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 48px Inter, Arial';
+      ctx.fillText('GAME OVER', W/2, H/2 - 18);
+      ctx.font = '18px Inter, Arial';
+      ctx.fillText(`Score: ${score}  •  High: ${high}`, W/2, H/2 + 12);
+    }
+  }
+
+  // main loop
+  function loop(ts){
+    const dt = Math.min(0.035, (ts - last) / 1000);
+    last = ts;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // assets loaded callback
+  function onAssetsLoaded(){
+    // place an initial set of pipes to populate scene
+    spawnPipeSet(W + 200);
+    // start rendering
+    last = performance.now();
+    requestAnimationFrame(loop);
+    // initial overlay shown
+    overlay.style.display = 'flex';
+    overlayTitle.textContent = 'Tap to Start';
+    overlaySub.textContent = 'Tap or press Space to flap';
+  }
+
+  // ensure we call init after images loaded by loader above
+  // reset initially
+  reset();
+
+  // Expose for debugging
+  window.ff = { reset, flapAction };
+
+  // ensure audio resume on first user interaction
+  document.body.addEventListener('pointerdown', ()=>{ if (actx && actx.state === 'suspended') actx.resume(); }, { once: true });
+
+})();
+</script>
+</body>
+</html>
